@@ -1,0 +1,7 @@
+streamlit>=1.20
+pandas
+numpy
+prophet
+matplotlib
+scikit-learn
+joblib
