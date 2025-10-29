@@ -8,6 +8,18 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import joblib
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import Ridge
+from tqdm import tqdm
+
+# Optional fallback
+from lightgbm import LGBMRegressor
+
+# === Import your base forecasting utilities ===
+from model_utils import (
+    train_prophet_model_meta, predict_prophet_meta,
+    train_lightgbm_model_meta, iterative_forecast_lgb_meta,
+    train_sarima_model_meta, predict_sarima_meta
+)
 
 # Try to import Prophet and LightGBM
 try:
@@ -35,8 +47,15 @@ DATA_FOLDER = "data"            # place processed_*.csv here
 MODEL_FOLDER = "models"         # model cache
 os.makedirs(MODEL_FOLDER, exist_ok=True)
 
+DATA_DIR = "data"
+META_DIR = "meta_data"
+META_MODEL_DIR = "meta_models"
+os.makedirs(META_DIR, exist_ok=True)
+os.makedirs(META_MODEL_DIR, exist_ok=True)
+
 st.set_page_config(page_title="Market Price Predictor", layout="wide")
-st.title("Market Price Predictor — Prophet & LightGBM")
+st.title("🌾 Agri Price Forecasting (Meta-Learner Integrated)")
+st.markdown("Dynamically generate, train and forecast for selected commodity and market.")
 
 # -----------------------
 # Helpers & cached loaders
@@ -53,6 +72,127 @@ def list_processed_files():
 @st.cache_data
 def load_csv(fp):
     return pd.read_csv(fp, parse_dates=["price_date"])
+
+
+# === Helper: Sliding Window Simulation ===
+@st.cache_data(show_spinner=False)
+def generate_meta_training_data_for_market(df, horizon, series_key):
+    """
+    Perform sliding window forecasting for a single time series (one market).
+    Uses precomputed features already in CSV.
+    Retrains models at each step.
+    """
+    results = []
+
+    df = df.copy()
+    df["price_date"] = pd.to_datetime(df["price_date"])
+    df = df.sort_values("price_date").reset_index(drop=True)
+
+    target_col = "modal_price_rs_per_kg"
+
+    # Features are already computed in your processed CSVs
+    feature_cols = [
+        "month", "day_of_week", "is_weekend",
+        "roll_mean_7", "roll_std_14",
+        "lag_1", "lag_7", "lag_30"
+    ]
+
+    min_train_size = 90  # can reduce if small dataset
+
+    for end_idx in tqdm(range(min_train_size, len(df) - horizon),
+                        desc=f"{series_key}-H{horizon}", leave=False):
+        train_df = df.iloc[:end_idx].copy()
+        test_df = df.iloc[end_idx : end_idx + horizon].copy()
+        if test_df.empty:
+            continue
+
+        forecast_date = test_df["price_date"].iloc[-1]
+
+        # --- Prophet ---
+        try:
+            m_prophet = train_prophet_model_meta(train_df)
+            pred_prophet_df = predict_prophet_meta(m_prophet, train_df, forecast_date.date())
+            prophet_pred = float(pred_prophet_df["prophet_pred"].iloc[-1])
+        except Exception:
+            prophet_pred = np.nan
+
+        # --- LightGBM ---
+        try:
+            m_lgb, _ = train_lightgbm_model_meta(train_df, feature_cols)
+            pred_lgb_list = iterative_forecast_lgb_meta(m_lgb, train_df, horizon, feature_cols)
+            lgbm_pred = float(pred_lgb_list[-1][1])
+        except Exception:
+            lgbm_pred = np.nan
+
+        # --- SARIMA ---
+        try:
+            m_sarima = train_sarima_model_meta(train_df)
+            pred_sarima_df = predict_sarima_meta(m_sarima, train_df, forecast_date.date())
+            sarima_pred = float(pred_sarima_df["sarima_pred"].iloc[-1])
+
+        except Exception:
+            sarima_pred = np.nan
+
+        # --- Actual ---
+        actual_value = df.loc[df["price_date"] == forecast_date, target_col].values
+        actual_value = float(actual_value[0]) if len(actual_value) else np.nan
+
+        # --- Context features ---
+        row = df.loc[df["price_date"] == forecast_date, feature_cols]
+        if not row.empty:
+            row_dict = row.iloc[0].to_dict()
+        else:
+            row_dict = {col: np.nan for col in feature_cols}
+
+        results.append({
+            "series_key": series_key,
+            "price_date": forecast_date,
+            "prophet_pred": prophet_pred,
+            "lgbm_pred": lgbm_pred,
+            "sarima_pred": sarima_pred,
+            "actual": actual_value,
+            **row_dict
+        })
+
+    meta_df = pd.DataFrame(results)
+    meta_df = meta_df[
+        ["series_key", "price_date", "prophet_pred", "lgbm_pred", "sarima_pred", "actual",
+         "month", "day_of_week", "is_weekend",
+         "roll_mean_7", "roll_std_14", "lag_1", "lag_7", "lag_30"]
+    ]
+    return meta_df
+
+# -------------------------------------------------------------------
+# === Meta Learner Training ===
+# -------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def train_meta_learner(meta_df, commodity, market, horizon):
+    X = meta_df[["prophet_pred", "lgbm_pred", "sarima_pred",
+                 "month", "day_of_week", "is_weekend",
+                 "roll_mean_7", "roll_std_14", "lag_1", "lag_7", "lag_30"]]
+    y = meta_df["actual"]
+
+    # Clean NaNs
+    X = X.replace([np.inf, -np.inf], np.nan).dropna()
+    y = y.loc[X.index]
+
+    # Try Ridge first (robust for small data)
+    try:
+        model = Ridge(alpha=1.0)
+        model.fit(X, y)
+        algo_used = "Ridge Regression"
+    except Exception:
+        model = LGBMRegressor(n_estimators=200, learning_rate=0.05)
+        model.fit(X, y)
+        algo_used = "LightGBM Regressor"
+
+    # Save model
+    model_path = os.path.join(
+        META_MODEL_DIR, f"meta_model_{commodity}_{market}_h{horizon}.pkl"
+    )
+    joblib.dump(model, model_path)
+
+    return model, algo_used, model_path
 
 @st.cache_resource
 def train_prophet_model(series_df, model_path):
@@ -219,7 +359,7 @@ if market == "-- choose --":
     st.stop()
 
 # options
-model_choice = st.sidebar.selectbox("Model", ["Prophet", "LightGBM", "TFT", "All"])
+model_choice = st.sidebar.selectbox("Model", ["Prophet", "LightGBM", "TFT", "All", "Meta-Learner"])
 eval_horizon = st.sidebar.number_input("Evaluation horizon (days holdout)", min_value=7, max_value=180, value=30, step=1)
 cap_ci_zero = st.sidebar.checkbox("Cap Prophet CI lower bound at 0 (display)", value=True)
 target_date = st.sidebar.date_input("Target date", value=(df["price_date"].max().date() + pd.Timedelta(days=30)),
@@ -361,6 +501,78 @@ if model_choice in ("TFT", "All"):
             except Exception as e:
                 st.error(f"SARIMA (TFT) error: {e}")
                 sarima_model = None
+
+# ==========================================
+# 🧠 META-LEARNER ENSEMBLE MODEL
+# ==========================================
+if model_choice == "Meta-Learner":
+    st.subheader("🧠 Meta-Learner (Ensemble Model)")
+    
+    series_key = f"{commodity}___{market}"
+    meta_csv_path = os.path.join(META_DIR, f"meta_{commodity}_{market}_h{eval_horizon}.csv")
+    meta_model_path = os.path.join(META_MODEL_DIR, f"meta_model_{commodity}_{market}_h{eval_horizon}.pkl")
+
+    # --- Step 1: Generate Meta-Training Data ---
+    if not os.path.exists(meta_csv_path):
+        with st.spinner(f"⏳ Generating meta-training data for {series_key}..."):
+            meta_df = generate_meta_training_data_for_market(series, eval_horizon, series_key)
+            meta_df.to_csv(meta_csv_path, index=False)
+            st.success(f"Meta-training data generated and saved → {meta_csv_path}")
+    else:
+        st.info("📁 Using cached meta-training data")
+        meta_df = pd.read_csv(meta_csv_path, parse_dates=["price_date"])
+
+    # --- Step 2: Train Meta-Learner (Ridge/LightGBM fallback) ---
+    if not os.path.exists(meta_model_path):
+        with st.spinner("🧩 Training meta-learner model..."):
+            model_meta, algo_used, model_path = train_meta_learner(meta_df, commodity, market, eval_horizon)
+            st.success(f"Meta-Learner trained using {algo_used} and saved → {model_path}")
+    else:
+        model_meta = joblib.load(meta_model_path)
+        st.info("📁 Loaded existing meta-learner model")
+
+    # --- Step 3: Predict and Evaluate Meta-Learner ---
+    X = meta_df[["prophet_pred", "lgbm_pred", "sarima_pred",
+                 "month", "day_of_week", "is_weekend",
+                 "roll_mean_7", "roll_std_14", "lag_1", "lag_7", "lag_30"]]
+    y = meta_df["actual"]
+
+    # Drop NaNs for safety
+    X = X.replace([np.inf, -np.inf], np.nan).dropna()
+    y = y.loc[X.index]
+
+    y_pred_meta = model_meta.predict(X)
+
+    rmse = np.sqrt(mean_squared_error(y, y_pred_meta))
+    mae = mean_absolute_error(y, y_pred_meta)
+    r2 = r2_score(y, y_pred_meta)
+
+    st.markdown("### 📊 Ensemble Model Performance")
+    st.write(f"**RMSE:** {rmse:.2f}")
+    st.write(f"**MAE:** {mae:.2f}")
+    st.write(f"**R² Score:** {r2:.3f}")
+
+
+    # --- Step 4: Plot Comparison ---
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(meta_df["price_date"], meta_df["actual"], label="Actual", color="black", linewidth=2)
+    ax.plot(meta_df["price_date"], meta_df["prophet_pred"], label="Prophet", linestyle="--", alpha=0.6)
+    ax.plot(meta_df["price_date"], meta_df["lgbm_pred"], label="LightGBM", linestyle="--", alpha=0.6)
+    ax.plot(meta_df["price_date"], meta_df["sarima_pred"], label="SARIMA", linestyle="--", alpha=0.6)
+    ax.plot(meta_df["price_date"], y_pred_meta, label="Meta-Learner Ensemble", color="blue", linewidth=2.5)
+    ax.set_title(f"{commodity} – {market} (Horizon: {eval_horizon})")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.5)
+    st.pyplot(fig)
+
+    # --- Step 5: Display sample predictions ---
+    display_df = meta_df[["price_date", "actual", "prophet_pred", "lgbm_pred", "sarima_pred"]].copy()
+    display_df["meta_pred"] = y_pred_meta
+    st.markdown("### 🧾 Sample Meta Predictions")
+    st.dataframe(display_df.tail(15))
+
 
 # -----------------------
 # Display predictions
