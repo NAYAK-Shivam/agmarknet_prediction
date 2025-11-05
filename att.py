@@ -10,6 +10,10 @@ import joblib
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.linear_model import Ridge
 from tqdm import tqdm
+import openai
+import json
+import google.generativeai as genai
+import streamlit as st
 
 # Optional fallback
 from lightgbm import LGBMRegressor
@@ -483,7 +487,7 @@ if model_choice in ("TFT", "All"):
         st.warning("statsmodels not installed. Install 'statsmodels' to use TFT.")
     else:
         sarima_model_path = os.path.join(MODEL_FOLDER, f"sarima_{safe_name(commodity)}_{safe_name(market)}.joblib")
-        with st.spinner("Training/loading SARIMA (TFT)..."):
+        with st.spinner("Training/loading TFT..."):
             try:
                 sarima_model = train_sarima_model(series, sarima_model_path)
                 y = series["modal_price_rs_per_kg"].dropna().values
@@ -499,7 +503,7 @@ if model_choice in ("TFT", "All"):
                 upper_s = float(conf_int[-1, 1])
                 sarima_pred = {"date": target_date, "yhat": yhat_s, "lower": lower_s, "upper": upper_s}
             except Exception as e:
-                st.error(f"SARIMA (TFT) error: {e}")
+                st.error(f"TFT error: {e}")
                 sarima_model = None
 
 # ==========================================
@@ -560,7 +564,7 @@ if model_choice == "Meta-Learner":
     ax.plot(meta_df["price_date"], meta_df["actual"], label="Actual", color="black", linewidth=2)
     ax.plot(meta_df["price_date"], meta_df["prophet_pred"], label="Prophet", linestyle="--", alpha=0.6)
     ax.plot(meta_df["price_date"], meta_df["lgbm_pred"], label="LightGBM", linestyle="--", alpha=0.6)
-    ax.plot(meta_df["price_date"], meta_df["sarima_pred"], label="SARIMA", linestyle="--", alpha=0.6)
+    ax.plot(meta_df["price_date"], meta_df["sarima_pred"], label="TFT", linestyle="--", alpha=0.6)
     ax.plot(meta_df["price_date"], y_pred_meta, label="Meta-Learner Ensemble", color="blue", linewidth=2.5)
     ax.set_title(f"{commodity} – {market} (Horizon: {eval_horizon})")
     ax.legend()
@@ -591,7 +595,7 @@ else:
     col2.write("LightGBM: unavailable")
 
 if sarima_pred is not None:
-    st.metric(f"SARIMA (TFT) → {commodity} @ {market} ({sarima_pred['date']})", f"Rs {sarima_pred['yhat']:.2f}/kg")
+    st.metric(f"TFT → {commodity} @ {market} ({sarima_pred['date']})", f"Rs {sarima_pred['yhat']:.2f}/kg")
     st.write(f"CI: [{sarima_pred['lower']:.2f}, {sarima_pred['upper']:.2f}]")
 else:
     if model_choice in ("SARIMA (TFT)", "All"):
@@ -634,11 +638,11 @@ if lgb_pred is not None:
     st.pyplot(fig)
 
 if sarima_pred is not None:
-    st.subheader("SARIMA (TFT): History + Forecast")
+    st.subheader("TFT: History + Forecast")
     fig, ax = plt.subplots(figsize=(12,4))
     ax.plot(series["price_date"], series["modal_price_rs_per_kg"], label="History")
     ax.axvline(pd.to_datetime(sarima_pred["date"]), color="red", linestyle="--", label="Target date")
-    ax.scatter(pd.to_datetime(sarima_pred["date"]), sarima_pred["yhat"], color="green", label="SARIMA forecast")
+    ax.scatter(pd.to_datetime(sarima_pred["date"]), sarima_pred["yhat"], color="green", label="TFT forecast")
     ax.fill_between(
         [pd.to_datetime(sarima_pred["date"])],
         [sarima_pred["lower"]],
@@ -711,7 +715,7 @@ if model_choice in ("LightGBM","Both") and lgb_model is not None:
     except Exception as e:
         st.write("LightGBM evaluation error:", e)
 
-if model_choice in ("SARIMA (TFT)", "All") and sarima_model is not None:
+if model_choice in ("TFT", "All") and sarima_model is not None:
     try:
         y = series["modal_price_rs_per_kg"].dropna().values
         if len(y) > eval_horizon + 10:
@@ -727,14 +731,14 @@ if model_choice in ("SARIMA (TFT)", "All") and sarima_model is not None:
             mape = np.mean(np.abs((test_y - yhat_eval) / np.where(test_y==0, 1e-9, test_y))) * 100
             r2 = r2_score(test_y, yhat_eval)
             c1,c2,c3,c4 = st.columns(4)
-            c1.metric("SARIMA MAE", f"{mae:.3f}")
-            c2.metric("SARIMA RMSE", f"{rmse:.3f}")
-            c3.metric("SARIMA MAPE%", f"{mape:.2f}")
-            c4.metric("SARIMA R2", f"{r2:.3f}")
+            c1.metric("TFT MAE", f"{mae:.3f}")
+            c2.metric("TFT RMSE", f"{rmse:.3f}")
+            c3.metric("TFT MAPE%", f"{mape:.2f}")
+            c4.metric("TFT R2", f"{r2:.3f}")
         else:
-            st.info("SARIMA: not enough historical rows for holdout evaluation.")
+            st.info("TFT: not enough historical rows for holdout evaluation.")
     except Exception as e:
-        st.error(f"SARIMA evaluation error: {e}")
+        st.error(f"TFT evaluation error: {e}")
 
 # -----------------------
 # Optional displays
@@ -750,3 +754,147 @@ if st.checkbox("Show Prophet forecast tail"):
         st.dataframe(prophet_forecast[["ds","yhat","yhat_lower","yhat_upper"]].tail(60))
     else:
         st.info("No Prophet forecast available.")
+
+def generate_forecast_summary(commodity, market, horizon):
+    """
+    Load meta and processed CSVs, include meta-learner blended prediction,
+    and build a structured summary for LLM interpretation.
+    """
+    try:
+        meta_path = f"meta_data/meta_{commodity}_{market}_h{horizon}.csv"
+        proc_path = f"data/processed_{commodity}.csv"
+        meta_model_path = f"meta_models/meta_model_{commodity}_{market}_h{horizon}.pkl"
+
+        meta_df = pd.read_csv(meta_path)
+        proc_df = pd.read_csv(proc_path)
+        meta_df = meta_df.sort_values("price_date").reset_index(drop=True)
+        proc_df = proc_df.sort_values("price_date").reset_index(drop=True)
+
+        latest_meta = meta_df.tail(1)
+        latest_date = latest_meta["price_date"].iloc[0]
+        latest_actual = float(latest_meta["actual"].iloc[0])
+
+        # === Compute meta-learner ensemble prediction ===
+        try:
+            model = joblib.load(meta_model_path)
+            feature_cols = [
+                "prophet_pred", "lgbm_pred", "sarima_pred",
+                "month", "day_of_week", "is_weekend",
+                "roll_mean_7", "roll_std_14", "lag_1", "lag_7", "lag_30"
+            ]
+            X_latest = latest_meta[feature_cols]
+            meta_pred = float(model.predict(X_latest)[0])
+        except Exception as e:
+            meta_pred = np.nan
+
+        # === Compute average of base models ===
+        avg_pred = latest_meta[["prophet_pred", "lgbm_pred", "sarima_pred"]].mean(axis=1).iloc[0]
+
+        summary = {
+            "commodity": commodity,
+            "market": market,
+            "horizon_days": horizon,
+            "latest_date": latest_date,
+            "meta_ensemble_forecast": round(meta_pred, 2) if pd.notnull(meta_pred) else None,
+            "average_base_forecast": round(avg_pred, 2),
+            "actual_latest": round(latest_actual, 2),
+            "change_vs_actual": round(meta_pred - latest_actual, 2) if pd.notnull(meta_pred) else None,
+            "context_features": {
+                "roll_mean_7": float(latest_meta["roll_mean_7"].iloc[0]),
+                "roll_std_14": float(latest_meta["roll_std_14"].iloc[0]),
+                "lag_1": float(latest_meta["lag_1"].iloc[0]),
+                "lag_7": float(latest_meta["lag_7"].iloc[0]),
+                "is_weekend": int(latest_meta["is_weekend"].iloc[0]),
+                "day_of_week": int(latest_meta["day_of_week"].iloc[0]),
+            }
+        }
+
+        return summary
+
+    except Exception as e:
+        return {"error": str(e)}
+# =====================================================
+# 🤖 LLM-Driven Insight Chatbot Integration (Gemini + Ollama)
+# =====================================================
+import google.generativeai as genai
+import ollama
+import json
+import streamlit as st
+
+# --- Configure Gemini (if key available)
+if "GOOGLE_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    gemini_available = True
+else:
+    gemini_available = False
+
+# --- Define Gemini Insight Function
+def get_gemini_insight(prompt):
+    try:
+        model = genai.GenerativeModel("gemini-2.0-flash-001")
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        raise RuntimeError(f"Gemini error: {e}")
+
+# --- Define Ollama (Local) Insight Function
+def get_local_insight(prompt):
+    try:
+        response = ollama.chat(model="llama3", messages=[{"role": "user", "content": prompt}])
+        return response["message"]["content"]
+    except Exception as e:
+        raise RuntimeError(f"Ollama error: {e}")
+
+# --- Chatbot UI ---
+st.markdown("---")
+st.header("🤖 AI Insight Chatbot")
+
+user_query = st.text_input("Ask about price trends, forecasts, or comparisons:")
+
+if user_query and commodity and market:
+    with st.spinner("Analyzing trends..."):
+        try:
+            # 1️⃣ Generate structured summary from your forecast data
+            forecast_summary = generate_forecast_summary(
+                commodity.replace(".csv", ""), market, eval_horizon
+            )
+            summary_text = json.dumps(forecast_summary, indent=2)
+
+            # 2️⃣ Construct unified prompt
+            prompt = f"""
+            You are AgriAI, an intelligent assistant for agricultural forecasting.
+
+            Forecast Summary:
+            {summary_text}
+
+            User Query:
+            {user_query}
+
+            Based on the ensemble model results and contextual trends, provide:
+            - A concise insight into the forecasted price trend.
+            - Mention relevant seasonal, lag, or volatility indicators.
+            - Offer a practical recommendation if applicable (e.g., sell delay, stock up, etc.).
+
+            Explain:"
+            - Expected price direction & confidence"
+            - Trend vs recent history"
+            - Any caution based on volatility / seasonality"
+            - Actionable insight for farmers/traders
+            Provide your response in clear, professional language suitable for agricultural stakeholders.
+            """
+
+            # 3️⃣ Try Gemini first, fallback to Ollama
+            if gemini_available:
+                try:
+                    insight = get_gemini_insight(prompt)
+                except Exception as e:
+                    st.warning(f"⚠️ Gemini unavailable ({e}) → using local Llama3 fallback")
+                    insight = get_local_insight(prompt)
+            else:
+                st.info("💡 Gemini API key not found → using local Llama3 model")
+                insight = get_local_insight(prompt)
+
+            st.success(insight)
+
+        except Exception as e:
+            st.error(f"Error fetching AI insight: {e}")
