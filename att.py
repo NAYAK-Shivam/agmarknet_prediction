@@ -822,8 +822,8 @@ import json
 import streamlit as st
 
 # --- Configure Gemini (if key available)
-#if "GOOGLE_API_KEY" in st.secrets:
-#    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+if "GOOGLE_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
     gemini_available = True
 else:
     gemini_available = False
